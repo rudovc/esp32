@@ -1,0 +1,3 @@
+[hooks.enter]
+shell = "zsh"
+script = "source /opt/esp-idf/export.sh"
