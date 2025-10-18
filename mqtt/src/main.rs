@@ -4,14 +4,19 @@
 use core::pin::pin;
 use core::time::Duration;
 
-use embassy_futures::select::{select, Either};
+use embassy_futures::select::select;
+use embassy_futures::select::Either;
 
 use esp_idf_svc::eventloop::EspSystemEventLoop;
+use esp_idf_svc::hal::gpio::Gpio5;
+use esp_idf_svc::hal::gpio::PinDriver;
 use esp_idf_svc::hal::peripherals::Peripherals;
 use esp_idf_svc::mqtt::client::*;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use esp_idf_svc::sys::EspError;
-use esp_idf_svc::timer::{EspAsyncTimer, EspTaskTimerService, EspTimerService};
+use esp_idf_svc::timer::EspAsyncTimer;
+use esp_idf_svc::timer::EspTaskTimerService;
+use esp_idf_svc::timer::EspTimerService;
 use esp_idf_svc::wifi::*;
 
 use log::*;
@@ -23,6 +28,8 @@ const MQTT_URL: &str = "mqtt://192.168.1.4:1883";
 const MQTT_CLIENT_ID: &str = "esp32";
 const MQTT_TOPIC: &str = "test";
 
+const ON_BYTES: &[u8] = "ON".as_bytes();
+
 fn main() {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
@@ -32,16 +39,16 @@ fn main() {
     let nvs = EspDefaultNvsPartition::take().unwrap();
 
     esp_idf_svc::hal::task::block_on(async {
-        let _wifi = wifi_create(&sys_loop, &timer_service, &nvs).await?;
+        let (_wifi, gpio) = peripherals_create(&sys_loop, &timer_service, &nvs).await?;
         info!("Wifi created");
 
         let (mut client, mut conn) = mqtt_create(MQTT_URL, MQTT_CLIENT_ID)?;
         info!("MQTT client created");
 
         let mut timer = timer_service.timer_async()?;
-        run(&mut client, &mut conn, &mut timer, MQTT_TOPIC).await
+        run(&mut client, &mut conn, &mut timer, MQTT_TOPIC, gpio).await
     })
-    .unwrap();
+    .unwrap()
 }
 
 async fn run(
@@ -49,6 +56,7 @@ async fn run(
     connection: &mut EspAsyncMqttConnection,
     timer: &mut EspAsyncTimer,
     topic: &str,
+    gpio: Gpio5,
 ) -> Result<(), EspError> {
     info!("About to start the MQTT client");
 
@@ -65,8 +73,33 @@ async fn run(
         pin!(async move {
             info!("MQTT Listening for messages");
 
+            let mut output = PinDriver::output(gpio)?;
+
             while let Ok(event) = connection.next().await {
-                info!("[Queue] Event: {}", event.payload());
+                info!("[Queue] Received event: {}", event.payload());
+
+                if let EventPayload::Received {
+                    id: _,
+                    topic: _,
+                    data,
+                    details: _,
+                } = event.payload()
+                {
+                    if data == ON_BYTES {
+                        output.set_high()?;
+                        info!("Set high");
+
+                        EspTimerService::new()?
+                            .timer_async()?
+                            .after(Duration::from_millis(500))
+                            .await?;
+
+                        info!("Set low");
+                        output.set_low()?;
+                    } else {
+                        warn!("Event payload not recognised")
+                    }
+                }
             }
 
             info!("Connection closed");
@@ -90,18 +123,8 @@ async fn run(
                 // Just to give a chance of our connection to get even the first published message
                 timer.after(Duration::from_millis(500)).await?;
 
-                let payload = "Hello from esp-mqtt-demo!";
-
                 loop {
-                    client
-                        .publish(topic, QoS::AtMostOnce, false, payload.as_bytes())
-                        .await?;
-
-                    info!("Published \"{payload}\" to topic \"{topic}\"");
-
                     let sleep_secs = 2;
-
-                    info!("Now sleeping for {sleep_secs}s...");
                     timer.after(Duration::from_secs(sleep_secs)).await?;
                 }
             }
@@ -130,14 +153,16 @@ fn mqtt_create(
     Ok((mqtt_client, mqtt_conn))
 }
 
-async fn wifi_create(
+async fn peripherals_create(
     sys_loop: &EspSystemEventLoop,
     timer_service: &EspTaskTimerService,
     nvs: &EspDefaultNvsPartition,
-) -> Result<EspWifi<'static>, EspError> {
+) -> Result<(EspWifi<'static>, Gpio5), EspError> {
     let peripherals = Peripherals::take()?;
+    let modem = peripherals.modem;
+    let gpio = peripherals.pins.gpio5;
 
-    let mut esp_wifi = EspWifi::new(peripherals.modem, sys_loop.clone(), Some(nvs.clone()))?;
+    let mut esp_wifi = EspWifi::new(modem, sys_loop.clone(), Some(nvs.clone()))?;
     let mut wifi = AsyncWifi::wrap(&mut esp_wifi, sys_loop.clone(), timer_service.clone())?;
 
     wifi.set_configuration(&Configuration::Client(ClientConfiguration {
@@ -155,5 +180,5 @@ async fn wifi_create(
     wifi.wait_netif_up().await?;
     info!("Wifi netif up");
 
-    Ok(esp_wifi)
+    Ok((esp_wifi, gpio))
 }
